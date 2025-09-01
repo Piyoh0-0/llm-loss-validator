@@ -240,12 +240,12 @@ def clean_model_cache(
         cache_path = Path(cache_path)
         for item in cache_path.iterdir():
             if item.is_dir() and item.name.startswith("models"):
-                if item.name not in {
-                    f"models--{BASE_MODEL.replace('/', '--')}"
-                    for BASE_MODEL in SUPPORTED_BASE_MODELS
-                }:
-                    shutil.rmtree(item)
-                    logger.info(f"Removed directory: {item}")
+                # if item.name not in {
+                #     f"models--{BASE_MODEL.replace('/', '--')}"
+                #     for BASE_MODEL in SUPPORTED_BASE_MODELS
+                # }:
+                shutil.rmtree(item)
+                logger.info(f"Removed directory: {item}")
         logger.info("Successfully cleaned up the local model cache")
     except (OSError, shutil.Error) as e:
         logger.error(f"Failed to clean up the local model cache: {e}")
