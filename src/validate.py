@@ -8,7 +8,8 @@ import gc
 import click
 import torch
 import requests
-from huggingface_hub import HfApi, hf_hub_url, scan_cache_dir, delete_cache_entries
+from huggingface_hub import HfApi, hf_hub_url, scan_cache_dir
+from huggingface_hub._cache_manager import delete_cache_entries
 import tempfile
 from loguru import logger
 from transformers import (
