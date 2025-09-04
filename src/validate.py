@@ -8,6 +8,7 @@ import gc
 import click
 import torch
 import requests
+from huggingface_hub import HfApi, hf_hub_url, scan_cache_dir, delete_cache_entries
 import tempfile
 from loguru import logger
 from transformers import (
@@ -240,15 +241,172 @@ def clean_model_cache(
         cache_path = Path(cache_path)
         for item in cache_path.iterdir():
             if item.is_dir() and item.name.startswith("models"):
-                # if item.name not in {
-                #     f"models--{BASE_MODEL.replace('/', '--')}"
-                #     for BASE_MODEL in SUPPORTED_BASE_MODELS
-                # }:
-                shutil.rmtree(item)
-                logger.info(f"Removed directory: {item}")
+                if item.name not in {
+                    f"models--{BASE_MODEL.replace('/', '--')}"
+                    for BASE_MODEL in SUPPORTED_BASE_MODELS
+                }:
+                    shutil.rmtree(item)
+                    logger.info(f"Removed directory: {item}")
         logger.info("Successfully cleaned up the local model cache")
     except (OSError, shutil.Error) as e:
         logger.error(f"Failed to clean up the local model cache: {e}")
+
+
+# --- Helper functions for cache/space management ---
+def _estimate_repo_size_bytes(repo_id: str, revision: str = "main", token: str = HF_TOKEN) -> int:
+    """
+    Estimate total size (in bytes) to download a repo from Hugging Face.
+    Prefers HF API metadata; falls back to HEAD on each file if needed.
+    """
+    api = HfApi()
+    total = 0
+    try:
+        # Try to get files metadata (sizes) via API
+        info = api.model_info(repo_id, revision=revision, files_metadata=True, token=token)
+        if getattr(info, "siblings", None):
+            for f in info.siblings:
+                # Sum only large/weight-ish files primarily
+                name = getattr(f, "rfilename", "")
+                size = getattr(f, "size", None)
+                if size is None:
+                    continue
+                if name.endswith((".safetensors", ".bin", ".gguf", ".pt")) or "pytorch_model" in name or "model.safetensors" in name:
+                    total += int(size)
+            # If nothing matched (very small/LoRA repo), sum all available sizes
+            if total == 0:
+                for f in info.siblings:
+                    if getattr(f, "size", None) is not None:
+                        total += int(f.size)
+            return int(total)
+    except Exception:
+        # fall through to HEAD approach
+        pass
+
+    # Fallback: list sibling files (without sizes), then HEAD to get Content-Length
+    try:
+        info = api.model_info(repo_id, revision=revision, token=token)
+        for f in getattr(info, "siblings", []):
+            name = getattr(f, "rfilename", "")
+            # prioritize big files; if unknown, still try to HEAD
+            if not name:
+                continue
+            try:
+                url = hf_hub_url(repo_id=repo_id, filename=name, revision=revision)
+                headers = {"Authorization": f"Bearer {token}"} if token else {}
+                r = requests.head(url, allow_redirects=True, timeout=15, headers=headers)
+                size = int(r.headers.get("Content-Length", "0"))
+                # Weight-ish files are the primary contributors; sum others as fallback
+                if name.endswith((".safetensors", ".bin", ".gguf", ".pt")) or size > 0:
+                    total += size
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return int(total)
+
+
+def _resolve_base_and_eval_repos_from_resp(resp_json: dict, token: str = HF_TOKEN) -> tuple[str, str, str, bool]:
+    """
+    From the assignment 'resp' JSON, resolve:
+    - base_repo_id (HF repo id of the base model)
+    - eval_repo_id (HF repo id to be validated; LoRA or full FT)
+    - revision (str)
+    - is_lora (bool)
+    Uses adapter_config.json if the eval repo is LoRA.
+    """
+    eval_repo_id = resp_json["task_submission"]["data"]["hg_repo_id"]
+    revision = resp_json["task_submission"]["data"].get("revision", "main")
+    # Try to detect LoRA by fetching adapter_config.json (small)
+    is_lora = False
+    try:
+        if download_lora_config(eval_repo_id, revision):
+            adapter_config_path = Path("lora/adapter_config.json")
+            if adapter_config_path.exists():
+                with open(adapter_config_path, "r") as f:
+                    adapter = json.load(f)
+                base_repo_id = adapter.get("base_model_name_or_path", eval_repo_id)
+                is_lora = True
+            else:
+                base_repo_id = eval_repo_id
+        else:
+            base_repo_id = eval_repo_id
+    except Exception:
+        base_repo_id = eval_repo_id
+    return base_repo_id, eval_repo_id, revision, is_lora
+
+
+def _estimate_required_bytes_from_resp(resp_json: dict) -> int:
+    """
+    Estimate bytes required to download for this assignment:
+    - LoRA: base model size + LoRA repo size
+    - Full FT: full model size
+    Adds no extra margin here; margin is handled by _ensure_space_for_download.
+    """
+    base_repo, eval_repo, revision, is_lora = _resolve_base_and_eval_repos_from_resp(resp_json)
+    try:
+        if is_lora:
+            base_sz = _estimate_repo_size_bytes(base_repo, revision=revision)
+            lora_sz = _estimate_repo_size_bytes(eval_repo, revision=revision)
+            return int(base_sz + lora_sz)
+        else:
+            full_sz = _estimate_repo_size_bytes(eval_repo, revision=revision)
+            return int(full_sz)
+    except Exception:
+        # Fallback: assume a conservative default (e.g., small Qwen tier)
+        return int(6 * 1024**3)  # 6 GiB
+
+
+def _ensure_space_for_download(required_bytes: int, cache_root: str = file_utils.default_cache_path) -> None:
+    """
+    Ensure there is enough free space for 'required_bytes' (+ reserve).
+    If not enough, delete HF cache entries starting from the smallest using scan_cache_dir.
+    """
+    root = Path(cache_root).expanduser().resolve()
+    # Reserve margin (env overrideable)
+    reserve = int(os.getenv("HF_CACHE_FREE_RESERVE_BYTES", 2 * 1024**3))  # 2 GiB
+    # Check free space on the filesystem where the cache resides. If not found, fall back to "/".
+    stat_path = root if root.exists() else Path("/")
+    free = shutil.disk_usage(stat_path).free
+    need = required_bytes + reserve - free
+    if need <= 0:
+        logger.info(
+            f"Enough space: free={free/1e9:.2f}GB, need={(required_bytes+reserve)/1e9:.2f}GB (incl. reserve)"
+        )
+        return
+
+    try:
+        report = scan_cache_dir(str(root))
+    except Exception as e:
+        logger.warning(f"scan_cache_dir failed ({e}); cannot free intelligently")
+        return
+
+    # Collect candidates (repos first, then blobs), sort by size ascending
+    candidates = []
+    try:
+        candidates.extend(sorted(report.repos, key=lambda r: r.size_on_disk))
+    except Exception:
+        pass
+    try:
+        candidates.extend(sorted(report.blobs, key=lambda b: b.size_on_disk))
+    except Exception:
+        pass
+
+    freed = 0
+    to_delete = []
+    for entry in candidates:
+        to_delete.append(entry)
+        freed += getattr(entry, "size_on_disk", 0) or 0
+        if freed >= need:
+            break
+
+    if not to_delete:
+        logger.warning("No HF cache entries eligible for deletion. Skipping purge.")
+        return
+
+    delete_cache_entries(to_delete)
+    logger.info(
+        f"Freed ~{freed/1e9:.2f}GB to make room for {(required_bytes+reserve)/1e9:.2f}GB (incl. reserve)"
+    )
 
 
 @click.group()
@@ -589,10 +747,19 @@ def loop(
     logger.info(f"Validating task_id: {task_id_list}")
     last_successful_request_time = [time.time()] * len(task_id_list)
     while True:
-        clean_model_cache(auto_clean_cache)
 
         for index, task_id_num in enumerate(task_id_list):
             resp = fed_ledger.request_validation_assignment(task_id_num)
+            if auto_clean_cache:
+                try:
+                    if resp.status_code == 200:
+                        # Estimate required bytes from the assignment payload (base + model/LoRA)
+                        required_bytes = _estimate_required_bytes_from_resp(resp.json())
+                        _ensure_space_for_download(required_bytes)
+                except Exception as e:
+                    logger.warning(f"Space estimation failed ({e}); falling back to legacy cleaning")
+                    clean_model_cache(True)
+
             if resp.status_code == 200:
                 last_successful_request_time[index] = time.time()
                 break
