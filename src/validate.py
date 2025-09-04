@@ -8,8 +8,14 @@ import gc
 import click
 import torch
 import requests
-from huggingface_hub import HfApi, hf_hub_url, scan_cache_dir
-from huggingface_hub._cache_manager import delete_cache_entries
+from huggingface_hub import HfApi, hf_hub_url
+try:
+    # Prefer public API when available
+    from huggingface_hub import scan_cache_dir, delete_cache_entries  # type: ignore
+except Exception:
+    # Older versions may not expose these at top-level
+    scan_cache_dir = None  # type: ignore
+    delete_cache_entries = None  # type: ignore
 import tempfile
 from loguru import logger
 from transformers import (
@@ -360,7 +366,8 @@ def _estimate_required_bytes_from_resp(resp_json: dict) -> int:
 def _ensure_space_for_download(required_bytes: int, cache_root: str = file_utils.default_cache_path) -> None:
     """
     Ensure there is enough free space for 'required_bytes' (+ reserve).
-    If not enough, delete HF cache entries starting from the smallest using scan_cache_dir.
+    If not enough, prefer huggingface_hub's cache manager. If unavailable, fall back to
+    deleting models--* directories (ascending by size) until enough space is freed.
     """
     root = Path(cache_root).expanduser().resolve()
     # Reserve margin (env overrideable)
@@ -375,10 +382,71 @@ def _ensure_space_for_download(required_bytes: int, cache_root: str = file_utils
         )
         return
 
+    # If scan_cache_dir/delete_cache_entries are not available, do a directory-based fallback purge.
+    if scan_cache_dir is None or delete_cache_entries is None:
+        hub = root / "hub" if (root / "hub").exists() else root
+        items: list[tuple[Path, int]] = []
+        try:
+            for p in hub.iterdir():
+                if p.is_dir() and p.name.startswith("models--"):
+                    try:
+                        sz = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+                    except Exception:
+                        sz = 0
+                    items.append((p, sz))
+        except Exception as e:
+            logger.warning(f"Failed to enumerate cache entries in fallback: {e}")
+
+        items.sort(key=lambda x: x[1])  # small to large
+        freed = 0
+        for p, sz in items:
+            try:
+                shutil.rmtree(p, ignore_errors=True)
+                freed += sz
+                logger.info(f"Removed cache dir (fallback): {p} (~{sz/1e9:.2f}GB)")
+            except Exception as e:
+                logger.warning(f"Failed to remove {p} in fallback: {e}")
+            if freed >= need:
+                break
+
+        logger.info(
+            f"Freed ~{freed/1e9:.2f}GB (fallback) to make room for {(required_bytes+reserve)/1e9:.2f}GB"
+        )
+        return
+
+    # Preferred path: use huggingface_hub cache report and delete smallest entries first.
     try:
         report = scan_cache_dir(str(root))
     except Exception as e:
-        logger.warning(f"scan_cache_dir failed ({e}); cannot free intelligently")
+        logger.warning(f"scan_cache_dir failed ({e}); falling back to directory-based purge")
+        hub = root / "hub" if (root / "hub").exists() else root
+        items: list[tuple[Path, int]] = []
+        try:
+            for p in hub.iterdir():
+                if p.is_dir() and p.name.startswith("models--"):
+                    try:
+                        sz = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+                    except Exception:
+                        sz = 0
+                    items.append((p, sz))
+        except Exception as e2:
+            logger.warning(f"Failed to enumerate cache entries in fallback: {e2}")
+
+        items.sort(key=lambda x: x[1])  # small to large
+        freed = 0
+        for p, sz in items:
+            try:
+                shutil.rmtree(p, ignore_errors=True)
+                freed += sz
+                logger.info(f"Removed cache dir (fallback): {p} (~{sz/1e9:.2f}GB)")
+            except Exception as e3:
+                logger.warning(f"Failed to remove {p} in fallback: {e3}")
+            if freed >= need:
+                break
+
+        logger.info(
+            f"Freed ~{freed/1e9:.2f}GB (fallback) to make room for {(required_bytes+reserve)/1e9:.2f}GB"
+        )
         return
 
     # Collect candidates (repos first, then blobs), sort by size ascending
