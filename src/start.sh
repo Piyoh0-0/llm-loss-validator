@@ -35,6 +35,9 @@ while true; do
     if [ $EXIT_CODE -eq 100 ]; then
         echo "CUDA error detected, restarting the process..."
         continue
+    elif [ $EXIT_CODE -eq 1 ]; then
+        echo "Unexpected error detected, restarting the process..."
+        continue
     elif [ $EXIT_CODE -ne 0 ]; then
         echo "Validation failed with exit code $EXIT_CODE"
         exit $EXIT_CODE
